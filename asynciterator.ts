@@ -29,6 +29,9 @@ export function setTaskScheduler(scheduler: TaskScheduler): void {
 }
 
 
+/** Key indicating the current consumer of a source. */
+export const DESTINATION = Symbol('destination');
+
 /**
   ID of the INIT state.
   An iterator is initializing if it is preparing main item generation.
@@ -84,6 +87,7 @@ export const DESTROYED = 1 << 5;
 export class AsyncIterator<T> extends EventEmitter {
   protected _state: number;
   private _readable = false;
+  private _upToDate = true;
   protected _properties?: { [name: string]: any };
   protected _propertyCallbacks?: { [name: string]: [(value: any) => void] };
 
@@ -222,6 +226,8 @@ export class AsyncIterator<T> extends EventEmitter {
   protected _end(destroy = false) {
     if (this._changeState(destroy ? DESTROYED : ENDED)) {
       this._readable = false;
+      this.removeAllListeners('up-to-date');
+      this.removeAllListeners('unreadable');
       this.removeAllListeners('readable');
       this.removeAllListeners('data');
       this.removeAllListeners('end');
@@ -258,8 +264,30 @@ export class AsyncIterator<T> extends EventEmitter {
     if (this._readable !== readable) {
       this._readable = readable;
       // If the iterator became readable, emit the `readable` event
-      if (readable)
+      if (readable) {
+        this.upToDate = false;
         taskScheduler(() => this.emit('readable'));
+      }
+      else {
+        taskScheduler(() => this.emit('unreadable'));
+      }
+    }
+  }
+
+  get upToDate() {
+    return this._upToDate;
+  }
+
+  set upToDate(upToDate) {
+    upToDate = Boolean(upToDate) && !this.done;
+    // Set the readable value only if it has changed
+    if (this._upToDate !== upToDate) {
+      this._upToDate = upToDate;
+      // If the iterator became readable, emit the `readable` event
+      if (upToDate)
+        taskScheduler(() => this.emit('up-to-date'));
+      else if ((this as any)[DESTINATION])
+        (this as any)[DESTINATION].upToDate = false;
     }
   }
 
@@ -812,9 +840,6 @@ export function identity<S>(item: S): typeof item {
   return item;
 }
 
-/** Key indicating the current consumer of a source. */
-export const DESTINATION = Symbol('destination');
-
 
 /**
  An iterator that synchronously transforms every item from its source
@@ -869,6 +894,9 @@ export class MappingIterator<S, D = S> extends AsyncIterator<D> {
       // Close this iterator if the source is empty
       if (this._source.done)
         this.close();
+
+      if (this._source.upToDate && !this._source.readable)
+        this.upToDate = true;
     }
     return null;
   }
@@ -1244,6 +1272,7 @@ export class TransformIterator<S, D = S> extends BufferedIterator<D> {
     else {
       source.on('end', destinationCloseWhenDone);
       source.on('readable', destinationFillBuffer);
+      source.on('up-to-date', destinationFillBuffer);
       source.on('error', destinationEmitError);
     }
   }
@@ -1281,14 +1310,29 @@ export class TransformIterator<S, D = S> extends BufferedIterator<D> {
     Tries to read transformed items.
   */
   protected _read(count: number, done: () => void) {
+    const doneRead = () => {
+      done();
+      // iterator didn't push any items so next time it becomes unreadable it should be up-to-date
+      if (this.source?.upToDate) {
+        if (this.readable) {
+          this.once('unreadable', () => {
+            if (this.source?.upToDate)
+              this.upToDate = true;
+          });
+        }
+        else {
+          this.upToDate = true;
+        }
+      }
+    };
     const next = () => {
       // Continue transforming until at least `count` items have been pushed
       if (this._pushedCount < count && !this.closed)
-        taskScheduler(() => this._readAndTransform(next, done));
+        taskScheduler(() => this._readAndTransform(next, doneRead));
       else
-        done();
+        doneRead();
     };
-    this._readAndTransform(next, done);
+    this._readAndTransform(next, doneRead);
   }
 
   /**
@@ -1374,7 +1418,6 @@ function destinationFillBuffer<S>(this: InternalSource<S>) {
     (this[DESTINATION] as any)._fillBuffer();
 }
 
-
 /**
   An iterator that generates items based on a source iterator
   and simple transformation steps passed as arguments.
@@ -1438,8 +1481,22 @@ export class SimpleTransformIterator<S, D = S> extends TransformIterator<S, D> {
 
   /* Tries to read and transform items */
   protected _read(count: number, done: () => void) {
-    const next = () => this._readAndTransformSimple(count, nextAsync, done);
-    this._readAndTransformSimple(count, nextAsync, done);
+    const doneRead = () => {
+      done();
+      if (this.source?.upToDate) {
+        if (this.readable) {
+          this.once('unreadable', () => {
+            if (this.source?.upToDate)
+              this.upToDate = true;
+          });
+        }
+        else {
+          this.upToDate = true;
+        }
+      }
+    };
+    const next = () => this._readAndTransformSimple(count, nextAsync, doneRead);
+    this._readAndTransformSimple(count, nextAsync, doneRead);
     function nextAsync() {
       taskScheduler(next);
     }
@@ -1612,6 +1669,17 @@ export class MultiTransformIterator<S, D = S> extends TransformIterator<S, D> {
       this.close();
     }
     done();
+    if (source && source.upToDate) {
+      if (this.readable) {
+        this.once('unreadable', () => {
+          if (source.upToDate)
+            this.upToDate = true;
+        });
+      }
+      else {
+        this.upToDate = true;
+      }
+    }
   }
 
   /**
@@ -1717,6 +1785,7 @@ export class UnionIterator<T> extends BufferedIterator<T> {
       source[DESTINATION] = this;
       source.on('error', destinationEmitError);
       source.on('readable', destinationFillBuffer);
+      source.on('up-to-date', destinationFillBuffer);
       source.on('end', destinationRemoveEmptySources);
     }
   }
@@ -1734,6 +1803,27 @@ export class UnionIterator<T> extends BufferedIterator<T> {
 
   // Reads items from the next sources
   protected _read(count: number, done: () => void): void {
+    const doneRead = () => {
+      done();
+      if (this._pending?.sources?.upToDate === false)
+        return;
+      for (const source of this._sources) {
+        if (!source.upToDate)
+          return;
+      }
+      if (this.readable) {
+        this.once('unreadable', () => {
+          for (const source of this._sources) {
+            if (!source.upToDate)
+              return;
+          }
+          this.upToDate = true;
+        });
+      }
+      else {
+        this.upToDate = true;
+      }
+    };
     // Start source loading if needed
     if (this._pending?.loading === false)
       this._loadSources();
@@ -1757,7 +1847,7 @@ export class UnionIterator<T> extends BufferedIterator<T> {
     // Close this iterator if all of its sources have been read
     if (!this._pending && this._sources.length === 0)
       this.close();
-    done();
+    doneRead();
   }
 
   protected _end(destroy: boolean = false) {
