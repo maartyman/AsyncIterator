@@ -87,7 +87,7 @@ export const DESTROYED = 1 << 5;
 export class AsyncIterator<T> extends EventEmitter {
   protected _state: number;
   private _readable = false;
-  private _upToDate = true;
+  private _upToDate = false;
   protected _properties?: { [name: string]: any };
   protected _propertyCallbacks?: { [name: string]: [(value: any) => void] };
 
@@ -873,6 +873,7 @@ export class MappingIterator<S, D = S> extends AsyncIterator<D> {
       this._source[DESTINATION] = this;
       this._source.on('end', destinationClose);
       this._source.on('error', destinationEmitError);
+      this._source.on('up-to-date', destinationSetReadable);
       this._source.on('readable', destinationSetReadable);
       this.readable = this._source.readable;
     }
@@ -895,7 +896,7 @@ export class MappingIterator<S, D = S> extends AsyncIterator<D> {
       if (this._source.done)
         this.close();
 
-      if (this._source.upToDate && !this._source.readable)
+      if (this._source.upToDate)
         this.upToDate = true;
     }
     return null;
@@ -1765,8 +1766,12 @@ export class UnionIterator<T> extends BufferedIterator<T> {
     }
     // Otherwise, set up source reading
     else {
+      (sources as any)[DESTINATION] = this;
       sources.on('data', source => {
         this._addSource(source as MaybePromise<InternalSource<T>>);
+        this._fillBufferAsync();
+      });
+      sources.on('up-to-date', source => {
         this._fillBufferAsync();
       });
       sources.on('end', () => {
@@ -1825,8 +1830,11 @@ export class UnionIterator<T> extends BufferedIterator<T> {
       }
     };
     // Start source loading if needed
-    if (this._pending?.loading === false)
+    if (this._pending?.loading === false) {
       this._loadSources();
+      done();
+      return;
+    }
 
     // Try to read `count` items
     let lastCount = 0, item : T | null;
