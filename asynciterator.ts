@@ -1307,6 +1307,8 @@ export class TransformIterator<S, D = S> extends BufferedIterator<D> {
     return ensureSourceAvailable(source, allowDestination);
   }
 
+  protected waitingForUnreadable = false;
+
   /**
     Tries to read transformed items.
   */
@@ -1314,9 +1316,15 @@ export class TransformIterator<S, D = S> extends BufferedIterator<D> {
     const doneRead = () => {
       done();
       // iterator didn't push any items so next time it becomes unreadable it should be up-to-date
+      if (this._reading || !(this as any)._buffer.empty)
+        return;
       if (this.source?.upToDate) {
-        if (this.readable) {
+        if (this.readable && !this.waitingForUnreadable) {
+          this.waitingForUnreadable = true;
           this.once('unreadable', () => {
+            this.waitingForUnreadable = false;
+            if (this._reading || !(this as any)._buffer.empty)
+              return;
             if (this.source?.upToDate)
               this.upToDate = true;
           });
@@ -1484,9 +1492,15 @@ export class SimpleTransformIterator<S, D = S> extends TransformIterator<S, D> {
   protected _read(count: number, done: () => void) {
     const doneRead = () => {
       done();
+      if (this._reading || !(this as any)._buffer.empty)
+        return;
       if (this.source?.upToDate) {
-        if (this.readable) {
+        if (this.readable && !this.waitingForUnreadable) {
+          this.waitingForUnreadable = true;
           this.once('unreadable', () => {
+            this.waitingForUnreadable = false;
+            if (this._reading || !(this as any)._buffer.empty)
+              return;
             if (this.source?.upToDate)
               this.upToDate = true;
           });
@@ -1670,9 +1684,15 @@ export class MultiTransformIterator<S, D = S> extends TransformIterator<S, D> {
       this.close();
     }
     done();
+    if (this._reading || !(this as any)._buffer.empty)
+      return;
     if (source && source.upToDate) {
-      if (this.readable) {
+      if (this.readable && !this.waitingForUnreadable) {
+        this.waitingForUnreadable = true;
         this.once('unreadable', () => {
+          this.waitingForUnreadable = false;
+          if (this._reading || !(this as any)._buffer.empty)
+            return;
           if (source.upToDate)
             this.upToDate = true;
         });
@@ -1806,18 +1826,27 @@ export class UnionIterator<T> extends BufferedIterator<T> {
     this._fillBuffer();
   }
 
+  private waitingForUnreadable = false;
   // Reads items from the next sources
   protected _read(count: number, done: () => void): void {
     const doneRead = () => {
       done();
+      if (this._reading || !(this as any)._buffer.empty)
+        return;
       if (this._pending?.sources?.upToDate === false)
         return;
       for (const source of this._sources) {
         if (!source.upToDate)
           return;
       }
-      if (this.readable) {
+      if (this.readable && !this.waitingForUnreadable) {
+        this.waitingForUnreadable = true;
         this.once('unreadable', () => {
+          this.waitingForUnreadable = false;
+          if (this._reading || !(this as any)._buffer.empty)
+            return;
+          if (this._pending?.sources?.upToDate === false)
+            return;
           for (const source of this._sources) {
             if (!source.upToDate)
               return;
@@ -1832,7 +1861,7 @@ export class UnionIterator<T> extends BufferedIterator<T> {
     // Start source loading if needed
     if (this._pending?.loading === false) {
       this._loadSources();
-      done();
+      doneRead();
       return;
     }
 
@@ -2190,8 +2219,13 @@ export class WrappingIterator<T> extends AsyncIterator<T> {
   read(): T | null {
     if (this._source !== null && this._source.readable !== false) {
       const item = this._source.read();
-      if (item !== null)
-        return item;
+      if (item !== null) {
+        // @ts-ignore
+        if (item === 'pause')
+          this.upToDate = true;
+        else
+          return item;
+      }
       this.readable = false;
     }
     return null;
